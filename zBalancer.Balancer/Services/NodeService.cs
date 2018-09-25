@@ -1,5 +1,6 @@
 ﻿using System.Threading.Tasks;
 using Microsoft.Extensions.Caching.Memory;
+using zBalancer.Balancer.Keys;
 using zBalancer.Balancer.Models;
 using zBalancer.Balancer.Repositories;
 
