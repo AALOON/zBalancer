@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Swashbuckle.AspNetCore.Swagger;
 using zBalancer.Balancer.Context;
@@ -16,8 +17,25 @@ using zBalancer.Balancer.Services;
 
 namespace zBalancer.Balancer
 {
+    /// <summary>
+    /// The Startup class configures services and the app's request pipeline.
+    /// </summary>
     public class Startup
     {
+        private readonly IConfiguration _config;
+
+        /// <summary>
+        /// The Startup .ctor for di the IConfiguration
+        /// </summary>
+        /// <param name="config"></param>
+        public Startup(IConfiguration config)
+        {
+            _config = config;
+        }
+
+        /// <summary>
+        /// Setups services to the container.
+        /// </summary>
         public void ConfigureServices(IServiceCollection services)
         {
             // Auto Mapper Configurations
@@ -30,7 +48,7 @@ namespace zBalancer.Balancer
 
             services.AddMvc().SetCompatibilityVersion(CompatibilityVersion.Version_2_1);
 
-            var connectionString = "Data Source=blogging.db";
+            var connectionString = _config.GetConnectionString("NodesDatabase");
             services.AddDbContext<NodeContext>
                 (options => options.UseSqlite(connectionString), ServiceLifetime.Singleton);
 
@@ -59,7 +77,9 @@ namespace zBalancer.Balancer
 
         }
 
-        // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
+        /// <summary>
+        /// Called by the runtime.This method configures the HTTP request pipeline.
+        /// </summary>
         public void Configure(IApplicationBuilder appBuilder, IHostingEnvironment env)
         {
             // Enable middleware to serve generated Swagger as a JSON endpoint.

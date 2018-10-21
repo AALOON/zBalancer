@@ -1,6 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Net.WebSockets;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -9,29 +12,35 @@ using zBalancer.Balancer.Models;
 
 namespace zBalancer.Balancer.Middlewares
 {  
+    /// <summary>
+    /// This middleware sends request to the next server
+    /// </summary>
     public class RequestSenderMiddleware : MiddlewareBase
     {
         private const int DefaultBufferSize = 4096;
         private readonly HttpClient _httpClient = new HttpClient(new HttpClientHandler());
-        private static readonly string[] NotForwardedWebSocketHeaders = new[] { "Connection", "Host", "Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Version" };
+
+        private static readonly HashSet<string> NotForwardedWebSocketHeaders = new HashSet<string>
+             { "connection", "host", "upgrade", "sec-websocket-key", "sec-websocket-version" };
         
 
         private readonly InternalProxyOptions _defaultOptions = new InternalProxyOptions()
         {
-            BackChannelMessageHandler = new HttpClientHandler(),
             BufferSize = DefaultBufferSize,
-            Score = 1,
             SendChunked = false,
-            UrlHost = null,
+            WebSocketKeepAliveInterval = TimeSpan.FromHours(1)
         };
 
         private readonly ILogger<RequestSenderMiddleware> _logger;
 
-        public RequestSenderMiddleware(RequestDelegate next, ILogger<RequestSenderMiddleware> logger) : base(next)
+        /// <inheritdoc />
+        public RequestSenderMiddleware(RequestDelegate next, ILogger<RequestSenderMiddleware> logger)
+            : base(next)
         {
             _logger = logger;
         }
 
+        /// <inheritdoc />
         public override async Task InvokeAsync(HttpContext context)
         {
             await MiddlewareInvoke(context);
@@ -40,8 +49,6 @@ namespace zBalancer.Balancer.Middlewares
         /// <summary>
         /// Entry point. Switch between websocket requests and regular http request
         /// </summary>
-        /// <param name="context"></param>
-        /// <returns></returns>
         protected override async Task MiddlewareInvoke(HttpContext context)
         {
             var options = _defaultOptions;
@@ -55,32 +62,37 @@ namespace zBalancer.Balancer.Middlewares
 
             if (!context.WebSockets.IsWebSocketRequest)
             {
-                await HandleHttpRequest(context, options, chost, cport, scheme);
+                await HandleHttpRequestAsync(context, options, chost, cport, scheme);
             }
             else
             {
-                throw new NotImplementedException();
+                await HandleWebSocketRequestAsync(context, options, chost, cport, scheme);
             }
         }
 
-        private async Task HandleHttpRequest(HttpContext context, InternalProxyOptions options, string host, int port, string scheme)
+        private async Task HandleHttpRequestAsync(HttpContext context,
+            InternalProxyOptions options, string host, int port, string scheme)
         {
             var requestMessage = new HttpRequestMessage();
             var requestMethod = context.Request.Method;
 
-            if (!HttpMethods.IsGet(requestMethod) && !HttpMethods.IsHead(requestMethod) && !HttpMethods.IsDelete(requestMethod) && !HttpMethods.IsTrace(requestMethod))
+            if (!HttpMethods.IsGet(requestMethod)
+                && !HttpMethods.IsHead(requestMethod)
+                && !HttpMethods.IsDelete(requestMethod)
+                && !HttpMethods.IsTrace(requestMethod))
             {
                 var streamContent = new StreamContent(context.Request.Body);
                 requestMessage.Content = streamContent;
             }
 
-            // All request headers and cookies must be transferend to remote server. Some headers will be skipped
+            // All request headers and cookies must be transferend to remote server.
+            // Some headers will be skipped
             foreach (var header in context.Request.Headers)
             {
-                if (!requestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()))
-                {
-                    requestMessage.Content?.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
-                }
+                var headerValue = header.Value.ToArray();
+                if (requestMessage.Headers.TryAddWithoutValidation(header.Key, headerValue))
+                    continue;
+                requestMessage.Content?.Headers.TryAddWithoutValidation(header.Key, headerValue);
             }
 
 
@@ -90,7 +102,9 @@ namespace zBalancer.Balancer.Middlewares
             var uriString = GetUri(context, host, port, scheme);
             requestMessage.RequestUri = new Uri(uriString);
             requestMessage.Method = new HttpMethod(context.Request.Method);
-            using (var responseMessage = await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted))
+            using (var responseMessage
+                = await _httpClient
+                    .SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted))
             {
                 context.Response.StatusCode = (int)responseMessage.StatusCode;
                 foreach (var header in responseMessage.Headers)
@@ -112,7 +126,7 @@ namespace zBalancer.Balancer.Middlewares
                 }
                 else
                 {
-                    var buffer = new byte[options.BufferSize ?? DefaultBufferSize];
+                    var buffer = new byte[options.BufferSize];
 
                     using (var responseStream = await responseMessage.Content.ReadAsStreamAsync())
                     {
@@ -133,6 +147,77 @@ namespace zBalancer.Balancer.Middlewares
 
         }
         
+        private async Task HandleWebSocketRequestAsync(HttpContext context,
+            InternalProxyOptions options, string host, int port, string scheme)
+        {
+
+            using (var client = new ClientWebSocket())
+            {
+                foreach (var headerEntry in context.Request.Headers)
+                {
+                    if (NotForwardedWebSocketHeaders.Contains(headerEntry.Key.ToLower()))
+                        continue;
+                    client.Options.SetRequestHeader(headerEntry.Key, headerEntry.Value);
+                }
+
+                // var wsScheme = string.Equals(scheme, "https", StringComparison.OrdinalIgnoreCase) ? "wss" : "ws";
+                string url = GetUri(context, host, port, scheme);
+
+                if (options.WebSocketKeepAliveInterval.HasValue)
+                {
+                    client.Options.KeepAliveInterval = options.WebSocketKeepAliveInterval.Value;
+                }
+
+                try
+                {
+                    await client.ConnectAsync(new Uri(url), context.RequestAborted);
+                }
+                catch (WebSocketException)
+                {
+                    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                    return;
+                }
+
+                using (var server = await context.WebSockets.AcceptWebSocketAsync(client.SubProtocol))
+                {
+                    await Task.WhenAll(PumpWebSocketAsync(client, server, options, context.RequestAborted),
+                        PumpWebSocketAsync(server, client, options, context.RequestAborted));
+                }
+            }
+        }
+        
+        private async Task PumpWebSocketAsync(WebSocket source,
+            WebSocket destination, InternalProxyOptions options, CancellationToken cancellationToken)
+        {
+            var buffer = new byte[options.BufferSize];
+            while (true)
+            {
+                WebSocketReceiveResult result;
+                try
+                {
+                    result = await source
+                        .ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    await destination.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable,
+                        "Operation canceled", cancellationToken);
+                    return;
+                }
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    if (source.CloseStatus != null)
+                        await destination.CloseOutputAsync(source.CloseStatus.Value,
+                            source.CloseStatusDescription, cancellationToken);
+                    return;
+                }
+
+                await destination.SendAsync(new ArraySegment<byte>(buffer, 0, result.Count),
+                    result.MessageType, result.EndOfMessage, cancellationToken);
+            }
+        }
+
         private static string GetUri(HttpContext context, string host, int? port, string scheme)
         {
             var urlPort = "";
@@ -143,29 +228,10 @@ namespace zBalancer.Balancer.Middlewares
             {
                 urlPort = ":" + port.Value;
             }
-            return $"{scheme}://{host}{urlPort}{context.Request.PathBase}{context.Request.Path}{context.Request.QueryString}";
-        }
-    }
-
-    public class InternalProxyOptions
-    {
-        private int? _bufferSize;
-        public long Score { get; set; }
-        public string UrlHost { get; set; }
-        public HttpMessageHandler BackChannelMessageHandler { get; set; }
-        public TimeSpan? WebSocketKeepAliveInterval { get; set; }
-        public bool SendChunked { get; set; }
-        public int? BufferSize
-        {
-            get => _bufferSize;
-            set
-            {
-                if (value.HasValue && value.Value <= 0)
-                {
-                    throw new ArgumentOutOfRangeException(nameof(value));
-                }
-                _bufferSize = value;
-            }
+            return $"{scheme}://" +
+                   $"{host}{urlPort}" +
+                   $"{context.Request.PathBase}{context.Request.Path}" +
+                   $"{context.Request.QueryString}";
         }
     }
 }
